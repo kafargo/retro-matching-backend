@@ -7,7 +7,7 @@ from ..services.state_service import build_game_state_payload, build_hand_payloa
 from ..models.game import Game, GamePhase
 from ..models.round import Round, RoundPhase
 from ..errors import GameNotFoundError, PhaseMismatchError, ForbiddenError, ValidationError
-from ..sockets.emitters import emit_game_state, emit_hand_to_all
+from ..sockets.emitters import emit_game_state, emit_hand_to_all, emit_hand_to_player
 
 games_bp = Blueprint("games", __name__)
 
@@ -249,6 +249,9 @@ def submit_card(code: str, round_id: int):
         raise ValidationError("card_id is required.")
 
     round_service.submit_card(game, round_obj, g.player, int(card_id))
+
+    # Send the updated hand (minus the played card) back to the submitting player
+    emit_hand_to_player(g.player)
 
     # Check if all players have now submitted
     if round_service.check_all_submitted(game, round_obj):

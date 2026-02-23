@@ -37,6 +37,9 @@ def create_app(env: str | None = None) -> Flask:
     with app.app_context():
         from .models import game, player, card, round, submission, vote  # noqa: F401
 
+        # Auto-create tables if they don't exist (e.g. fresh SQLite volume)
+        db.create_all()
+
     # Register blueprints
     from .api import register_blueprints
     register_blueprints(app)
