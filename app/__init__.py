@@ -24,10 +24,11 @@ def create_app(env: str | None = None) -> Flask:
     # Initialise extensions
     db.init_app(app)
     migrate.init_app(app, db)
-    cors.init_app(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}})
+    cors_origins = app.config["CORS_ORIGINS"]
+    cors.init_app(app, resources={r"/*": {"origins": cors_origins}})
     socketio.init_app(
         app,
-        cors_allowed_origins="*",
+        cors_allowed_origins=cors_origins,
         async_mode="eventlet",
         logger=False,
         engineio_logger=False,
