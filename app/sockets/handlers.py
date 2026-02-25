@@ -3,8 +3,9 @@ from flask import request
 from flask_socketio import join_room, leave_room
 from ..extensions import socketio, db
 from ..models.player import Player
-from ..models.game import Game
-from .emitters import register_socket, unregister_socket, emit_player_connection_changed
+from ..models.game import Game, GamePhase
+from ..models.round import Round, RoundPhase
+from .emitters import register_socket, unregister_socket, emit_player_connection_changed, emit_game_state
 
 
 @socketio.on("join_game_room")
@@ -78,6 +79,8 @@ def handle_disconnect() -> None:
     """Handle unexpected socket disconnection.
 
     Marks the associated player as disconnected without removing them from the game.
+    If the game is in the playing phase, re-checks whether the remaining connected
+    players have all submitted or voted, and advances the round phase if so.
     """
     token = unregister_socket(request.sid)
     if token is None:
@@ -94,3 +97,32 @@ def handle_disconnect() -> None:
         game = db.session.get(Game, player.game_id)
         if game:
             emit_player_connection_changed(game, player.id, False)
+
+            # Re-check if the remaining connected players satisfy round progression
+            if game.phase == GamePhase.PLAYING and game.current_round_id:
+                current_round = db.session.get(Round, game.current_round_id)
+                if current_round:
+                    _check_round_progress_after_disconnect(game, current_round)
+
+
+def _check_round_progress_after_disconnect(game: Game, round_obj: Round) -> None:
+    """After a player disconnects, check if remaining players have all submitted/voted.
+
+    If all connected players have submitted → transition to voting.
+    If all connected players have voted → tally and complete the round.
+
+    Args:
+        game: The Game instance.
+        round_obj: The current Round.
+    """
+    from ..services import round_service, vote_service
+
+    if round_obj.phase == RoundPhase.SUBMITTING:
+        if round_service.check_all_submitted(game, round_obj):
+            round_service.begin_voting(round_obj)
+            emit_game_state(game)
+
+    elif round_obj.phase == RoundPhase.VOTING:
+        if vote_service.all_voted(game, round_obj):
+            vote_service.tally_round(round_obj)
+            emit_game_state(game)

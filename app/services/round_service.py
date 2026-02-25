@@ -66,10 +66,12 @@ def _create_round(game: Game, round_number: int) -> Round:
     game.current_round_id = new_round.id
 
     # On the final round every player has exactly 1 card left — auto-submit it
-    # and skip straight to voting.
+    # and skip straight to voting. Only auto-submit for connected players.
     if round_number >= MAX_ROUNDS:
         players = _eligible_players(game)
         for player in players:
+            if not player.is_connected:
+                continue
             card = db.session.execute(
                 db.select(Card).where(
                     Card.holder_id == player.id,
@@ -147,24 +149,32 @@ def submit_card(game: Game, round_obj: Round, player: Player, card_id: int) -> S
 
 
 def check_all_submitted(game: Game, round_obj: Round) -> bool:
-    """Check whether all eligible players have submitted for this round.
+    """Check whether all connected non-spectator players have submitted for this round.
 
-    Eligible = all non-spectator players.
+    Disconnected players are excluded so the game can proceed without them.
 
     Args:
         game: The Game instance.
         round_obj: The current Round.
 
     Returns:
-        True if all eligible players have submitted.
+        True if all connected non-spectator players have submitted.
     """
-    players = _eligible_players(game)
+    from ..models.player import PlayerRole
+    eligible_count = db.session.execute(
+        db.select(db.func.count()).select_from(Player).where(
+            Player.game_id == game.id,
+            Player.is_connected.is_(True),
+            Player.role == PlayerRole.PLAYER,
+        )
+    ).scalar() or 0
+
     submitted_count = db.session.execute(
         db.select(db.func.count()).select_from(Submission).where(
             Submission.round_id == round_obj.id
         )
     ).scalar() or 0
-    return submitted_count >= len(players)
+    return submitted_count >= eligible_count
 
 
 def begin_voting(round_obj: Round) -> None:
