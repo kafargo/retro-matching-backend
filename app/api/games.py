@@ -218,11 +218,10 @@ def begin_game(code: str):
     if not_ready > 0:
         raise PhaseMismatchError("All players must be ready before the game can begin.")
 
-    # Redistribute cards, transition phase, create first round
+    # Redistribute cards, transition phase, create first round — all in one transaction
     card_service.redistribute_cards(game)
     game.phase = GamePhase.PLAYING
-    db.session.commit()
-
+    # Do NOT commit here — let create_first_round's commit handle phase + round atomically
     first_round = round_service.create_first_round(game)
 
     # Emit private hands to each player, then broadcast state
@@ -253,52 +252,22 @@ def submit_card(code: str, round_id: int):
     # Send the updated hand (minus the played card) back to the submitting player
     emit_hand_to_player(g.player)
 
-    # Check if all players have now submitted
+    # Check if all players have now submitted → transition to voting
     if round_service.check_all_submitted(game, round_obj):
-        round_service.reveal_round(round_obj)
+        round_service.begin_voting(round_obj)
 
     emit_game_state(game)
     return jsonify({"submitted": True}), 200
 
 
 # ---------------------------------------------------------------------------
-# Judge picks winner
-# ---------------------------------------------------------------------------
-
-@games_bp.route("/games/<code>/rounds/<int:round_id>/pick-winner", methods=["POST"])
-@require_auth
-def pick_winner(code: str, round_id: int):
-    """POST /api/games/<code>/rounds/<id>/pick-winner — judge selects winning card."""
-    game = _get_game(code)
-    round_obj = _get_round(game, round_id)
-
-    data = request.get_json(force=True) or {}
-    submission_id = data.get("submission_id")
-    if submission_id is None:
-        raise ValidationError("submission_id is required.")
-
-    winner = round_service.pick_winner(game, round_obj, g.player, int(submission_id))
-
-    # Check for final round trigger
-    if round_service.should_trigger_final_round(game):
-        final_round = round_service.create_final_round(game)
-        emit_game_state(game)
-        return jsonify({"winner_player_id": winner.id, "final_round_triggered": True}), 200
-
-    # Create next normal round
-    round_service.create_next_round(game)
-    emit_game_state(game)
-    return jsonify({"winner_player_id": winner.id, "final_round_triggered": False}), 200
-
-
-# ---------------------------------------------------------------------------
-# Vote in final round
+# Vote in a round
 # ---------------------------------------------------------------------------
 
 @games_bp.route("/games/<code>/rounds/<int:round_id>/vote", methods=["POST"])
 @require_auth
 def vote(code: str, round_id: int):
-    """POST /api/games/<code>/rounds/<id>/vote — cast a vote in the final round."""
+    """POST /api/games/<code>/rounds/<id>/vote — cast a vote during the voting phase."""
     game = _get_game(code)
     round_obj = _get_round(game, round_id)
 
@@ -309,14 +278,40 @@ def vote(code: str, round_id: int):
 
     vote_service.record_vote(game, round_obj, g.player, int(card_id))
 
-    # Check if all connected participants have voted
+    # Check if all connected players have voted → tally and complete round
     if vote_service.all_voted(game, round_obj):
-        final_scores = vote_service.tally_and_finish(game, round_obj)
+        winning_card_ids, winner_player_ids = vote_service.tally_round(round_obj)
         emit_game_state(game)
-        return jsonify({"voted": True, "game_finished": True, "final_scores": final_scores}), 200
+        return jsonify({
+            "voted": True,
+            "round_complete": True,
+            "winning_card_ids": winning_card_ids,
+            "winner_player_ids": winner_player_ids,
+        }), 200
 
     emit_game_state(game)
-    return jsonify({"voted": True, "game_finished": False}), 200
+    return jsonify({"voted": True, "round_complete": False}), 200
+
+
+# ---------------------------------------------------------------------------
+# Advance round (host only)
+# ---------------------------------------------------------------------------
+
+@games_bp.route("/games/<code>/rounds/<int:round_id>/advance", methods=["POST"])
+@require_auth
+def advance_round(code: str, round_id: int):
+    """POST /api/games/<code>/rounds/<id>/advance — host advances to next round or finishes."""
+    game = _get_game(code)
+    round_obj = _get_round(game, round_id)
+
+    next_round = round_service.advance_round(game, round_obj, g.player)
+
+    emit_game_state(game)
+
+    if next_round is None:
+        return jsonify({"game_finished": True}), 200
+
+    return jsonify({"game_finished": False, "next_round_id": next_round.id}), 200
 
 
 # ---------------------------------------------------------------------------

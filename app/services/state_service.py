@@ -8,13 +8,14 @@ from typing import Any
 from ..extensions import db
 from ..models.game import Game
 from ..models.round import RoundPhase
+from ..services.round_service import MAX_ROUNDS
 
 
 def build_game_state_payload(game: Game) -> dict[str, Any]:
     """Build the full game state dict for a room-wide broadcast.
 
     This payload is safe to send to every client in the room because:
-    - Card text is never included (hand contents go via targeted your_cards_updated)
+    - Card text is never included in hand data (hand contents go via targeted your_cards_updated)
     - Submission player attribution is never included when round.phase == submitting
     - Revealed submissions include card text but NOT which player submitted them
 
@@ -51,18 +52,22 @@ def build_game_state_payload(game: Game) -> dict[str, Any]:
         r = game.current_round
         submission_status = _build_submission_status(game, r)
         revealed = _build_revealed_submissions(r) if r.phase != RoundPhase.SUBMITTING else None
+        vote_status = _build_vote_status(game, r) if r.phase == RoundPhase.VOTING else None
+        winning_card_ids, winner_player_ids = (
+            _compute_winners(r) if r.phase == RoundPhase.COMPLETE else ([], [])
+        )
 
         current_round_data = {
             "id": r.id,
             "round_number": r.round_number,
-            "judge_id": r.judge_id,
             "adjective": r.adjective,
             "phase": r.phase.value,
-            "is_final_round": r.is_final_round,
             "submission_status": submission_status,
             "revealed_submissions": revealed,
-            "winner_id": r.winner_id,
-            "winning_card_id": r.winning_card_id,
+            "vote_status": vote_status,
+            "winning_card_ids": winning_card_ids,
+            "winner_player_ids": winner_player_ids,
+            "total_rounds": MAX_ROUNDS,
         }
 
     return {
@@ -78,9 +83,9 @@ def build_game_state_payload(game: Game) -> dict[str, Any]:
 
 
 def _build_submission_status(game: Game, round_obj) -> list[dict[str, Any]]:
-    """Build submission status list for the sidebar — who has submitted vs pending.
+    """Build submission status list — who has submitted vs pending.
 
-    Only non-judge, non-spectator players appear in this list.
+    All non-spectator players appear in this list.
 
     Args:
         game: The Game instance.
@@ -102,8 +107,6 @@ def _build_submission_status(game: Game, round_obj) -> list[dict[str, Any]]:
     for p in sorted(game.players, key=lambda x: x.join_order):
         if p.is_spectator:
             continue
-        if not round_obj.is_final_round and p.id == round_obj.judge_id:
-            continue
         result.append({
             "player_id": p.id,
             "display_name": p.display_name,
@@ -112,16 +115,49 @@ def _build_submission_status(game: Game, round_obj) -> list[dict[str, Any]]:
     return result
 
 
+def _build_vote_status(game: Game, round_obj) -> list[dict[str, Any]]:
+    """Build vote status list — who has voted vs pending.
+
+    Only non-spectator players are listed (spectators cannot vote).
+
+    Args:
+        game: The Game instance.
+        round_obj: The current Round instance.
+
+    Returns:
+        List of dicts with player_id, display_name, and has_voted.
+    """
+    from ..models.vote import Vote
+
+    voted_player_ids = {
+        v.voter_id
+        for v in db.session.execute(
+            db.select(Vote).where(Vote.round_id == round_obj.id)
+        ).scalars().all()
+    }
+
+    result = []
+    for p in sorted(game.players, key=lambda x: x.join_order):
+        if p.is_spectator:
+            continue
+        result.append({
+            "player_id": p.id,
+            "display_name": p.display_name,
+            "has_voted": p.id in voted_player_ids,
+        })
+    return result
+
+
 def _build_revealed_submissions(round_obj) -> list[dict[str, Any]]:
-    """Build anonymised revealed submissions for broadcast after all cards are in.
+    """Build anonymised revealed submissions for broadcast.
 
     Attribution (which player submitted which card) is intentionally excluded.
 
     Args:
-        round_obj: The Round instance in revealed or complete phase.
+        round_obj: The Round instance in voting or complete phase.
 
     Returns:
-        List of dicts with submission_id, card_type, and card_text only.
+        List of dicts with submission_id, card_id, card_type, and card_text only.
     """
     from ..models.submission import Submission
 
@@ -138,6 +174,44 @@ def _build_revealed_submissions(round_obj) -> list[dict[str, Any]]:
         }
         for s in submissions
     ]
+
+
+def _compute_winners(round_obj) -> tuple[list[int], list[int]]:
+    """Compute winning card IDs and winner player IDs from vote tally.
+
+    Args:
+        round_obj: The Round instance in complete phase.
+
+    Returns:
+        Tuple of (winning_card_ids, winner_player_ids).
+    """
+    from ..models.vote import Vote
+    from ..models.submission import Submission
+
+    votes = db.session.execute(
+        db.select(Vote).where(Vote.round_id == round_obj.id)
+    ).scalars().all()
+
+    if not votes:
+        return [], []
+
+    vote_counts: dict[int, int] = {}
+    for v in votes:
+        vote_counts[v.card_id] = vote_counts.get(v.card_id, 0) + 1
+
+    max_votes = max(vote_counts.values())
+    winning_card_ids = [cid for cid, cnt in vote_counts.items() if cnt == max_votes]
+
+    winning_submissions = db.session.execute(
+        db.select(Submission).where(
+            Submission.round_id == round_obj.id,
+            Submission.card_id.in_(winning_card_ids),
+        )
+    ).scalars().all()
+
+    winner_player_ids = [sub.player_id for sub in winning_submissions]
+
+    return winning_card_ids, winner_player_ids
 
 
 def build_hand_payload(player) -> dict[str, Any]:

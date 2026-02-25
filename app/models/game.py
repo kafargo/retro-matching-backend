@@ -12,7 +12,6 @@ class GamePhase(str, enum.Enum):
     LOBBY = "lobby"
     CARD_CREATION = "card_creation"
     PLAYING = "playing"
-    FINAL_ROUND = "final_round"
     FINISHED = "finished"
 
 

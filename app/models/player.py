@@ -28,7 +28,7 @@ class Player(db.Model):
         default=PlayerRole.PLAYER,
     )
     session_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
-    # 0-indexed join order, drives judge rotation; spectator is excluded from rotation
+    # 0-indexed join order; spectators are excluded from the player roster
     join_order: Mapped[int] = mapped_column(Integer, nullable=False)
     is_ready: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

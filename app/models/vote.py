@@ -1,4 +1,4 @@
-"""Vote model (used only in the final round)."""
+"""Vote model — used every round for all-player voting."""
 from datetime import datetime
 from sqlalchemy import Integer, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -6,7 +6,7 @@ from ..extensions import db
 
 
 class Vote(db.Model):
-    """A vote cast by any participant (including spectator) in the final round."""
+    """A vote cast by a player during the voting phase of any round."""
 
     __tablename__ = "votes"
     __table_args__ = (UniqueConstraint("round_id", "voter_id", name="uq_round_voter_vote"),)

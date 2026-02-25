@@ -1,4 +1,4 @@
-"""Round service — creation, submission handling, winner picking, and phase transitions."""
+"""Round service — creation, submission handling, and phase transitions."""
 from typing import Any
 from ..extensions import db
 from ..models.game import Game, GamePhase
@@ -14,6 +14,9 @@ from ..errors import (
     AlreadySubmittedError,
 )
 
+# The game always lasts exactly 6 rounds.
+MAX_ROUNDS = 6
+
 
 def create_first_round(game: Game) -> Round:
     """Create the first round of a game after begin is clicked.
@@ -28,7 +31,7 @@ def create_first_round(game: Game) -> Round:
 
 
 def create_next_round(game: Game) -> Round:
-    """Create the next normal round after the previous one completes.
+    """Create the next round after the previous one completes.
 
     Args:
         game: The Game instance currently in playing phase.
@@ -52,26 +55,46 @@ def _create_round(game: Game, round_number: int) -> Round:
     Returns:
         The saved Round instance.
     """
-    players = _eligible_players(game)
-    judge = players[(round_number - 1) % len(players)]
-
     new_round = Round(
         game_id=game.id,
         round_number=round_number,
-        judge_id=judge.id,
         adjective=pick_adjective(),
         phase=RoundPhase.SUBMITTING,
-        is_final_round=False,
     )
     db.session.add(new_round)
     db.session.flush()
     game.current_round_id = new_round.id
+
+    # On the final round every player has exactly 1 card left — auto-submit it
+    # and skip straight to voting.
+    if round_number >= MAX_ROUNDS:
+        players = _eligible_players(game)
+        for player in players:
+            card = db.session.execute(
+                db.select(Card).where(
+                    Card.holder_id == player.id,
+                    Card.is_played.is_(False),
+                    Card.game_id == game.id,
+                )
+            ).scalar_one_or_none()
+            if card is not None:
+                card.is_played = True
+                card.holder_id = None
+                db.session.add(Submission(
+                    round_id=new_round.id,
+                    player_id=player.id,
+                    card_id=card.id,
+                ))
+        new_round.phase = RoundPhase.VOTING
+
     db.session.commit()
     return new_round
 
 
 def submit_card(game: Game, round_obj: Round, player: Player, card_id: int) -> Submission:
     """Record a player's card submission for the current round.
+
+    All non-spectator players submit one card per round.
 
     Args:
         game: The Game instance.
@@ -84,7 +107,7 @@ def submit_card(game: Game, round_obj: Round, player: Player, card_id: int) -> S
 
     Raises:
         PhaseMismatchError: If the round is not in the submitting phase.
-        ForbiddenError: If the player is the judge or a spectator.
+        ForbiddenError: If the player is a spectator.
         AlreadySubmittedError: If the player already submitted this round.
         InvalidCardError: If the card is not held by the player or already played.
     """
@@ -92,8 +115,6 @@ def submit_card(game: Game, round_obj: Round, player: Player, card_id: int) -> S
         raise PhaseMismatchError("This round is not accepting submissions.")
     if player.is_spectator:
         raise ForbiddenError("Spectators cannot submit cards.")
-    if not round_obj.is_final_round and player.id == round_obj.judge_id:
-        raise ForbiddenError("The judge does not submit a card.")
 
     # Check for duplicate submission
     existing = db.session.execute(
@@ -128,7 +149,7 @@ def submit_card(game: Game, round_obj: Round, player: Player, card_id: int) -> S
 def check_all_submitted(game: Game, round_obj: Round) -> bool:
     """Check whether all eligible players have submitted for this round.
 
-    Eligible = non-spectator, non-judge players.
+    Eligible = all non-spectator players.
 
     Args:
         game: The Game instance.
@@ -138,139 +159,50 @@ def check_all_submitted(game: Game, round_obj: Round) -> bool:
         True if all eligible players have submitted.
     """
     players = _eligible_players(game)
-    submitters = [p for p in players if p.id != round_obj.judge_id]
     submitted_count = db.session.execute(
         db.select(db.func.count()).select_from(Submission).where(
             Submission.round_id == round_obj.id
         )
     ).scalar() or 0
-    return submitted_count >= len(submitters)
+    return submitted_count >= len(players)
 
 
-def reveal_round(round_obj: Round) -> None:
-    """Transition a round from submitting to revealed phase.
+def begin_voting(round_obj: Round) -> None:
+    """Transition a round from submitting to voting phase.
 
     Args:
-        round_obj: The Round to reveal.
+        round_obj: The Round to transition.
     """
-    round_obj.phase = RoundPhase.REVEALED
+    round_obj.phase = RoundPhase.VOTING
     db.session.commit()
 
 
-def pick_winner(game: Game, round_obj: Round, judge: Player, submission_id: int) -> Player:
-    """Judge picks the winning submission, awarding 1 point to the author.
+def advance_round(game: Game, round_obj: Round, requesting_player: Player) -> Round | None:
+    """Host advances to the next round, or finishes the game after the last round.
 
     Args:
         game: The Game instance.
-        round_obj: The current Round (must be in revealed phase).
-        judge: The judging player.
-        submission_id: ID of the winning Submission.
+        round_obj: The current Round (must be in complete phase).
+        requesting_player: Must be the game creator.
 
     Returns:
-        The winning Player instance.
+        The new Round if advancing, or None if the game is now finished.
 
     Raises:
-        ForbiddenError: If the caller is not the judge.
-        PhaseMismatchError: If the round is not in revealed phase.
-        InvalidCardError: If the submission does not belong to this round.
+        ForbiddenError: If the requester is not the creator.
+        PhaseMismatchError: If the round is not in complete phase.
     """
-    if round_obj.phase != RoundPhase.REVEALED:
-        raise PhaseMismatchError("Cards have not been revealed yet.")
-    if judge.id != round_obj.judge_id:
-        raise ForbiddenError("Only the judge can pick the winner.")
+    if game.creator_id != requesting_player.id:
+        raise ForbiddenError("Only the game creator can advance the round.")
+    if round_obj.phase != RoundPhase.COMPLETE:
+        raise PhaseMismatchError("The round has not been completed yet.")
 
-    submission = db.session.get(Submission, submission_id)
-    if submission is None or submission.round_id != round_obj.id:
-        raise InvalidCardError("Invalid submission selection.")
+    if round_obj.round_number >= MAX_ROUNDS:
+        game.phase = GamePhase.FINISHED
+        db.session.commit()
+        return None
 
-    winner = db.session.get(Player, submission.player_id)
-    winner.score += 1
-
-    round_obj.winner_id = winner.id
-    round_obj.winning_card_id = submission.card_id
-    round_obj.phase = RoundPhase.COMPLETE
-    db.session.commit()
-
-    return winner
-
-
-def should_trigger_final_round(game: Game) -> bool:
-    """Check if all non-spectator players have exactly 1 card left.
-
-    This condition triggers the final round.
-
-    Args:
-        game: The Game instance.
-
-    Returns:
-        True if the final round should begin.
-    """
-    players = _eligible_players(game)
-    for player in players:
-        held_count = db.session.execute(
-            db.select(db.func.count()).select_from(Card).where(
-                Card.holder_id == player.id,
-                Card.is_played.is_(False),
-            )
-        ).scalar() or 0
-        if held_count != 1:
-            return False
-    return len(players) > 0
-
-
-def create_final_round(game: Game) -> Round:
-    """Create the final round and auto-submit all remaining cards.
-
-    All players' single remaining cards are submitted without attribution.
-    The round transitions immediately to revealed phase.
-
-    Args:
-        game: The Game instance.
-
-    Returns:
-        The created final Round instance.
-    """
-    last_round_number = db.session.execute(
-        db.select(db.func.max(Round.round_number)).where(Round.game_id == game.id)
-    ).scalar() or 0
-
-    final_round = Round(
-        game_id=game.id,
-        round_number=last_round_number + 1,
-        judge_id=None,
-        adjective=pick_adjective(),
-        phase=RoundPhase.SUBMITTING,
-        is_final_round=True,
-    )
-    db.session.add(final_round)
-    db.session.flush()
-    game.current_round_id = final_round.id
-    game.phase = GamePhase.FINAL_ROUND
-    db.session.flush()
-
-    # Auto-submit each player's last card
-    players = _eligible_players(game)
-    for player in players:
-        last_card = db.session.execute(
-            db.select(Card).where(
-                Card.holder_id == player.id,
-                Card.is_played.is_(False),
-            )
-        ).scalar_one_or_none()
-        if last_card is not None:
-            last_card.is_played = True
-            last_card.holder_id = None
-            submission = Submission(
-                round_id=final_round.id,
-                player_id=player.id,
-                card_id=last_card.id,
-            )
-            db.session.add(submission)
-
-    final_round.phase = RoundPhase.REVEALED
-    db.session.commit()
-
-    return final_round
+    return create_next_round(game)
 
 
 def _eligible_players(game: Game) -> list[Player]:
