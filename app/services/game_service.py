@@ -65,7 +65,12 @@ def create_game(display_name: str, role: str) -> dict[str, Any]:
 
 
 def join_game(code: str, display_name: str) -> dict[str, Any]:
-    """Join an existing lobby game as a player.
+    """Join an existing game as a player, or rejoin if a disconnected player with
+    the same name already exists.
+
+    If the game is in lobby, a new player is created normally.
+    If the game has already started and a disconnected player with the same
+    display name exists, they are reconnected with a fresh session token.
 
     Args:
         code: The game code to join.
@@ -76,22 +81,40 @@ def join_game(code: str, display_name: str) -> dict[str, Any]:
 
     Raises:
         GameNotFoundError: If no game with that code exists.
-        PhaseMismatchError: If the game is not in the lobby phase.
-        DisplayNameTakenError: If the name is already taken in this game.
+        PhaseMismatchError: If the game has started and no reconnect match exists.
+        DisplayNameTakenError: If the name is taken by a connected player in the lobby.
     """
     game = _get_game_or_404(code)
 
-    if game.phase != GamePhase.LOBBY:
-        raise PhaseMismatchError("This game has already started and is not accepting new players.")
-
-    # Check name uniqueness within this game
-    existing_name = db.session.execute(
+    # Check if a player with this name already exists in the game (case-insensitive)
+    existing_player = db.session.execute(
         db.select(Player).where(
             Player.game_id == game.id,
-            Player.display_name == display_name,
+            db.func.lower(Player.display_name) == display_name.lower(),
         )
     ).scalar_one_or_none()
-    if existing_name is not None:
+
+    # --- Rejoin path: game already started, matching disconnected player ---
+    if game.phase != GamePhase.LOBBY:
+        if existing_player is None:
+            raise PhaseMismatchError("This game has already started and is not accepting new players.")
+        if existing_player.is_connected:
+            raise DisplayNameTakenError("That player is still connected.")
+
+        # Reconnect: issue a new session token and mark as connected
+        new_token = generate_session_token()
+        existing_player.session_token = new_token
+        existing_player.is_connected = True
+        db.session.commit()
+
+        return {
+            "session_token": new_token,
+            "player_id": existing_player.id,
+            "player": _player_dict(existing_player),
+        }
+
+    # --- Normal lobby join path ---
+    if existing_player is not None:
         raise DisplayNameTakenError()
 
     next_order = db.session.execute(
