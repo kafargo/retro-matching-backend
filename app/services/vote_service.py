@@ -60,30 +60,33 @@ def record_vote(game: Game, round_obj: Round, voter: Player, card_id: int) -> No
 
 
 def all_voted(game: Game, round_obj: Round) -> bool:
-    """Check whether all connected non-spectator players have voted.
+    """Check whether every currently-connected non-spectator player has voted.
+
+    Compares connected players against the set of voter_ids for this round, so
+    a disconnected player's leftover vote row doesn't prematurely tally the
+    round and lock other connected players out of voting.
 
     Args:
         game: The Game instance.
         round_obj: The current Round.
 
     Returns:
-        True if every connected non-spectator player has cast a vote.
+        True iff no connected non-spectator player is still pending a vote.
     """
-    eligible_count = db.session.execute(
+    voted_player_ids = (
+        db.select(Vote.voter_id)
+        .where(Vote.round_id == round_obj.id)
+        .scalar_subquery()
+    )
+    pending_count = db.session.execute(
         db.select(db.func.count()).select_from(Player).where(
             Player.game_id == game.id,
             Player.is_connected.is_(True),
             Player.role == PlayerRole.PLAYER,
+            Player.id.notin_(voted_player_ids),
         )
     ).scalar() or 0
-
-    voted_count = db.session.execute(
-        db.select(db.func.count()).select_from(Vote).where(
-            Vote.round_id == round_obj.id
-        )
-    ).scalar() or 0
-
-    return voted_count >= eligible_count
+    return pending_count == 0
 
 
 def tally_round(round_obj: Round) -> tuple[list[int], list[int]]:

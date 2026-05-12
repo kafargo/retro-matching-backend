@@ -149,32 +149,36 @@ def submit_card(game: Game, round_obj: Round, player: Player, card_id: int) -> S
 
 
 def check_all_submitted(game: Game, round_obj: Round) -> bool:
-    """Check whether all connected non-spectator players have submitted for this round.
+    """Check whether every currently-connected non-spectator player has submitted.
 
-    Disconnected players are excluded so the game can proceed without them.
+    We compare connected players against the set of submission player_ids rather
+    than counting both sides independently. If a player submitted and then
+    disconnected, their submission row stays in the DB; counting it against a
+    shrunken eligible set would prematurely advance the round and lock other
+    connected players out of submitting.
 
     Args:
         game: The Game instance.
         round_obj: The current Round.
 
     Returns:
-        True if all connected non-spectator players have submitted.
+        True iff no connected non-spectator player is still pending submission.
     """
     from ..models.player import PlayerRole
-    eligible_count = db.session.execute(
+    submitted_player_ids = (
+        db.select(Submission.player_id)
+        .where(Submission.round_id == round_obj.id)
+        .scalar_subquery()
+    )
+    pending_count = db.session.execute(
         db.select(db.func.count()).select_from(Player).where(
             Player.game_id == game.id,
             Player.is_connected.is_(True),
             Player.role == PlayerRole.PLAYER,
+            Player.id.notin_(submitted_player_ids),
         )
     ).scalar() or 0
-
-    submitted_count = db.session.execute(
-        db.select(db.func.count()).select_from(Submission).where(
-            Submission.round_id == round_obj.id
-        )
-    ).scalar() or 0
-    return submitted_count >= eligible_count
+    return pending_count == 0
 
 
 def begin_voting(round_obj: Round) -> None:
