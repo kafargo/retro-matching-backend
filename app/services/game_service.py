@@ -172,6 +172,59 @@ def start_game(game: Game, requesting_player: Player) -> None:
     db.session.commit()
 
 
+def remove_player(
+    game: Game, requesting_player: Player, target_player_id: int
+) -> dict[str, Any]:
+    """Host removes another player during the card_creation phase.
+
+    Card creation is the only phase where a connected-but-idle player can wedge
+    the game (they keep is_ready=False and block /begin). In every other phase
+    disconnect handling is sufficient, so removal is intentionally not allowed.
+
+    Args:
+        game: The Game instance.
+        requesting_player: Must be the game creator.
+        target_player_id: The player to remove.
+
+    Returns:
+        Snapshot of the deleted player (id, display_name, session_token) so the
+        caller can notify the kicked client's socket after the row is gone.
+
+    Raises:
+        ForbiddenError: If requester isn't the creator, or target is the creator.
+        PhaseMismatchError: If the game is not in card_creation phase.
+        ValidationError: If target_player_id doesn't belong to this game.
+    """
+    from ..errors import ValidationError
+
+    _assert_creator(game, requesting_player)
+    if game.phase != GamePhase.CARD_CREATION:
+        raise PhaseMismatchError("Players can only be removed during card creation.")
+
+    target = db.session.get(Player, target_player_id)
+    if target is None or target.game_id != game.id:
+        raise ValidationError("Player not found in this game.")
+    if target.id == game.creator_id:
+        raise ForbiddenError("The host cannot remove themselves.")
+
+    snapshot = {
+        "id": target.id,
+        "display_name": target.display_name,
+        "session_token": target.session_token,
+    }
+
+    from ..models.card import Card
+    # Safe in card_creation because cards have not been redistributed yet —
+    # holder_id still equals creator_id, so deleting by creator_id removes
+    # exactly the cards this player would have contributed to the pool.
+    db.session.execute(
+        db.delete(Card).where(Card.game_id == game.id, Card.creator_id == target.id)
+    )
+    db.session.delete(target)
+    db.session.commit()
+    return snapshot
+
+
 def finish_game(game: Game, requesting_player: Player) -> None:
     """Delete all game data once the game is finished.
 

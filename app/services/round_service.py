@@ -190,20 +190,31 @@ def begin_voting(round_obj: Round) -> None:
 def advance_round(game: Game, round_obj: Round, requesting_player: Player) -> Round | None:
     """Host advances to the next round, or finishes the game after the last round.
 
+    Normally only the creator may advance. As a safety hatch, if the creator is
+    currently disconnected, any connected non-spectator player may advance so a
+    dropped host doesn't strand the game at RoundPhase.COMPLETE.
+
     Args:
         game: The Game instance.
         round_obj: The current Round (must be in complete phase).
-        requesting_player: Must be the game creator.
+        requesting_player: The player asking to advance.
 
     Returns:
         The new Round if advancing, or None if the game is now finished.
 
     Raises:
-        ForbiddenError: If the requester is not the creator.
+        ForbiddenError: If the requester is not the creator and the creator is
+            still connected, or if the requester is a spectator/disconnected
+            during a host hand-off.
         PhaseMismatchError: If the round is not in complete phase.
     """
     if game.creator_id != requesting_player.id:
-        raise ForbiddenError("Only the game creator can advance the round.")
+        creator = db.session.get(Player, game.creator_id) if game.creator_id else None
+        creator_connected = bool(creator and creator.is_connected)
+        if creator_connected:
+            raise ForbiddenError("Only the game creator can advance the round.")
+        if requesting_player.is_spectator or not requesting_player.is_connected:
+            raise ForbiddenError("Only a connected player can advance the round.")
     if round_obj.phase != RoundPhase.COMPLETE:
         raise PhaseMismatchError("The round has not been completed yet.")
 

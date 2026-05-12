@@ -7,7 +7,7 @@ from ..services.state_service import build_game_state_payload, build_hand_payloa
 from ..models.game import Game, GamePhase
 from ..models.round import Round, RoundPhase
 from ..errors import GameNotFoundError, PhaseMismatchError, ForbiddenError, ValidationError
-from ..sockets.emitters import emit_game_state, emit_hand_to_all, emit_hand_to_player
+from ..sockets.emitters import emit_game_state, emit_hand_to_all, emit_hand_to_player, emit_player_removed
 
 games_bp = Blueprint("games", __name__)
 
@@ -191,6 +191,24 @@ def mark_ready(code: str):
 
 
 # ---------------------------------------------------------------------------
+# Remove a player (host-only, card_creation only)
+# ---------------------------------------------------------------------------
+
+@games_bp.route("/games/<code>/players/<int:player_id>", methods=["DELETE"])
+@require_auth
+def remove_player(code: str, player_id: int):
+    """DELETE /api/games/<code>/players/<id> — host removes a player during card creation."""
+    game = _get_game(code)
+    snapshot = game_service.remove_player(game, g.player, player_id)
+
+    # Notify the kicked client first (their socket is still alive for one more event),
+    # then broadcast the new roster to everyone else.
+    emit_player_removed(game.code, snapshot["session_token"], snapshot["id"])
+    emit_game_state(game)
+    return jsonify({"removed_player_id": snapshot["id"]}), 200
+
+
+# ---------------------------------------------------------------------------
 # Begin game (card_creation → playing)
 # ---------------------------------------------------------------------------
 
@@ -205,18 +223,46 @@ def begin_game(code: str):
     if game.phase != GamePhase.CARD_CREATION:
         raise PhaseMismatchError("Game is not in card creation phase.")
 
-    # Verify all non-spectator players are ready
+    # All non-spectator players must be connected at begin time. The host can
+    # use the remove-player flow to evict anyone who isn't coming back; otherwise
+    # they wait for a rejoin. The connected-then-ready checks follow.
     from ..models.player import Player, PlayerRole
-    not_ready = db.session.execute(
+    disconnected_count = db.session.execute(
         db.select(db.func.count()).select_from(Player).where(
             Player.game_id == game.id,
             Player.role == PlayerRole.PLAYER,
+            Player.is_connected.is_(False),
+        )
+    ).scalar() or 0
+
+    if disconnected_count > 0:
+        raise PhaseMismatchError(
+            "Disconnected players — either remove them or wait for them to rejoin before starting."
+        )
+
+    not_ready_connected = db.session.execute(
+        db.select(db.func.count()).select_from(Player).where(
+            Player.game_id == game.id,
+            Player.role == PlayerRole.PLAYER,
+            Player.is_connected.is_(True),
             Player.is_ready.is_(False),
         )
     ).scalar() or 0
 
-    if not_ready > 0:
-        raise PhaseMismatchError("All players must be ready before the game can begin.")
+    if not_ready_connected > 0:
+        raise PhaseMismatchError("All connected players must be ready before the game can begin.")
+
+    ready_connected = db.session.execute(
+        db.select(db.func.count()).select_from(Player).where(
+            Player.game_id == game.id,
+            Player.role == PlayerRole.PLAYER,
+            Player.is_connected.is_(True),
+            Player.is_ready.is_(True),
+        )
+    ).scalar() or 0
+
+    if ready_connected < 2:
+        raise PhaseMismatchError("At least 2 connected players are required to begin.")
 
     # Redistribute cards, transition phase, create first round — all in one transaction
     card_service.redistribute_cards(game)

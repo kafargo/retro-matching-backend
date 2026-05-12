@@ -71,6 +71,27 @@ def emit_hand_to_all(game: Game) -> None:
             emit_hand_to_player(player)
 
 
+def emit_player_removed(game_code: str, removed_session_token: str, removed_player_id: int) -> None:
+    """Notify a kicked player's socket that they were removed, then disconnect them.
+
+    The targeted client uses this event to clear local session state and redirect
+    home. We disconnect the socket so it can't keep receiving room broadcasts.
+
+    Args:
+        game_code: The game code (room name).
+        removed_session_token: The kicked player's session token (used to find their sid).
+        removed_player_id: The kicked player's id (sent so other clients can identify them).
+    """
+    socketio.emit(
+        "player_removed",
+        {"type": "player_removed", "player_id": removed_player_id},
+        room=game_code,
+    )
+    sid = _token_to_sid.pop(removed_session_token, None)
+    if sid:
+        socketio.disconnect(sid)
+
+
 def emit_player_connection_changed(game: Game, player_id: int, is_connected: bool) -> None:
     """Broadcast a player connection status change to the game room.
 
