@@ -124,20 +124,6 @@ def reconnect(code: str):
 
 
 # ---------------------------------------------------------------------------
-# Start game (lobby → card_creation)
-# ---------------------------------------------------------------------------
-
-@games_bp.route("/games/<code>/start", methods=["POST"])
-@require_auth
-def start_game(code: str):
-    """POST /api/games/<code>/start — creator transitions lobby to card creation."""
-    game = _get_game(code)
-    game_service.start_game(game, g.player)
-    emit_game_state(game)
-    return jsonify({"phase": game.phase.value}), 200
-
-
-# ---------------------------------------------------------------------------
 # Submit cards
 # ---------------------------------------------------------------------------
 

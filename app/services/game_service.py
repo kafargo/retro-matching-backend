@@ -34,7 +34,9 @@ def create_game(display_name: str, role: str) -> dict[str, Any]:
     else:
         code = generate_game_code()  # Accept small collision risk after 10 attempts
 
-    game = Game(code=code, phase=GamePhase.LOBBY)
+    # Games start directly in CARD_CREATION — no separate lobby step. Late joiners
+    # can still hop in while card_creation is open.
+    game = Game(code=code, phase=GamePhase.CARD_CREATION)
     db.session.add(game)
     db.session.flush()  # Get game.id without committing
 
@@ -65,12 +67,11 @@ def create_game(display_name: str, role: str) -> dict[str, Any]:
 
 
 def join_game(code: str, display_name: str) -> dict[str, Any]:
-    """Join an existing game as a player, or rejoin if a disconnected player with
-    the same name already exists.
+    """Join an existing game as a new player, or rejoin a disconnected slot.
 
-    If the game is in lobby, a new player is created normally.
-    If the game has already started and a disconnected player with the same
-    display name exists, they are reconnected with a fresh session token.
+    Brand-new players may join while the game is in LOBBY (legacy) or
+    CARD_CREATION. Once the game has reached PLAYING / FINISHED, only the
+    rejoin-by-name path is available for a disconnected player to come back.
 
     Args:
         code: The game code to join.
@@ -82,7 +83,7 @@ def join_game(code: str, display_name: str) -> dict[str, Any]:
     Raises:
         GameNotFoundError: If no game with that code exists.
         PhaseMismatchError: If the game has started and no reconnect match exists.
-        DisplayNameTakenError: If the name is taken by a connected player in the lobby.
+        DisplayNameTakenError: If the name is taken by a connected player.
     """
     game = _get_game_or_404(code)
 
@@ -94,14 +95,12 @@ def join_game(code: str, display_name: str) -> dict[str, Any]:
         )
     ).scalar_one_or_none()
 
-    # --- Rejoin path: game already started, matching disconnected player ---
-    if game.phase != GamePhase.LOBBY:
-        if existing_player is None:
-            raise PhaseMismatchError("This game has already started and is not accepting new players.")
+    # --- Reconnect path: same display name + disconnected → reattach to existing row.
+    # Works in every phase (including card_creation) so a player who drops in the
+    # initial stage can still come back with their original name.
+    if existing_player is not None:
         if existing_player.is_connected:
-            raise DisplayNameTakenError("That player is still connected.")
-
-        # Reconnect: issue a new session token and mark as connected
+            raise DisplayNameTakenError()
         new_token = generate_session_token()
         existing_player.session_token = new_token
         existing_player.is_connected = True
@@ -113,9 +112,10 @@ def join_game(code: str, display_name: str) -> dict[str, Any]:
             "player": _player_dict(existing_player),
         }
 
-    # --- Normal lobby join path ---
-    if existing_player is not None:
-        raise DisplayNameTakenError()
+    # --- New-join path: brand-new player. Only allowed while card_creation is open
+    # (LOBBY kept here for legacy DB rows; new games skip lobby entirely).
+    if game.phase not in (GamePhase.LOBBY, GamePhase.CARD_CREATION):
+        raise PhaseMismatchError("This game has already started and is not accepting new players.")
 
     next_order = db.session.execute(
         db.select(db.func.count()).select_from(Player).where(Player.game_id == game.id)
@@ -140,36 +140,6 @@ def join_game(code: str, display_name: str) -> dict[str, Any]:
         "player_id": player.id,
         "player": _player_dict(player),
     }
-
-
-def start_game(game: Game, requesting_player: Player) -> None:
-    """Transition a game from lobby to card_creation phase.
-
-    Args:
-        game: The Game instance.
-        requesting_player: Must be the game creator.
-
-    Raises:
-        ForbiddenError: If the requester is not the creator.
-        PhaseMismatchError: If the game is not in the lobby phase.
-    """
-    _assert_creator(game, requesting_player)
-    if game.phase != GamePhase.LOBBY:
-        raise PhaseMismatchError("Game is not in the lobby phase.")
-
-    # Need at least 2 players (non-spectator) to start
-    player_count = db.session.execute(
-        db.select(db.func.count()).select_from(Player).where(
-            Player.game_id == game.id,
-            Player.role == PlayerRole.PLAYER,
-        )
-    ).scalar() or 0
-
-    if player_count < 2:
-        raise PhaseMismatchError("At least 2 players are required to start.")
-
-    game.phase = GamePhase.CARD_CREATION
-    db.session.commit()
 
 
 def remove_player(
