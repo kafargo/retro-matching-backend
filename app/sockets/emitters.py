@@ -75,7 +75,9 @@ def emit_player_removed(game_code: str, removed_session_token: str, removed_play
     """Notify a kicked player's socket that they were removed, then disconnect them.
 
     The targeted client uses this event to clear local session state and redirect
-    home. We disconnect the socket so it can't keep receiving room broadcasts.
+    home. We *try* to disconnect the socket server-side as well so it can't keep
+    receiving room broadcasts, but any failure there must not break the REST
+    response — the client also tears down its own socket on receiving this event.
 
     Args:
         game_code: The game code (room name).
@@ -89,7 +91,13 @@ def emit_player_removed(game_code: str, removed_session_token: str, removed_play
     )
     sid = _token_to_sid.pop(removed_session_token, None)
     if sid:
-        socketio.disconnect(sid)
+        # Calling socketio.disconnect(sid) from a Flask request thread can throw
+        # depending on async mode / namespace state. Swallow it — the client
+        # cleans itself up off the player_removed event regardless.
+        try:
+            socketio.disconnect(sid)
+        except Exception:
+            pass
 
 
 def emit_player_connection_changed(game: Game, player_id: int, is_connected: bool) -> None:
